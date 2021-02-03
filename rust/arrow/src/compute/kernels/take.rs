@@ -29,6 +29,7 @@ use crate::util::bit_util;
 use crate::{array::*, buffer::buffer_bin_and};
 
 use num::{ToPrimitive, Zero};
+use std::iter::FromIterator;
 use TimeUnit::*;
 
 macro_rules! downcast_take {
@@ -407,6 +408,31 @@ where
     Ok(BooleanArray::from(Arc::new(data)))
 }
 
+/// Helper struct where we ensure the compile that the Iterators length can be trusted
+/// Can be made more generic over the Iterator Item.
+struct ManualTrustedLengthIter<I: Iterator<Item = u8>> {
+    iter: I,
+    len: usize,
+}
+
+impl<I: Iterator<Item = u8>> ManualTrustedLengthIter<I> {
+    fn new(iter: I, len: usize) -> Self {
+        ManualTrustedLengthIter { iter, len }
+    }
+}
+
+impl<I: Iterator<Item = u8>> Iterator for ManualTrustedLengthIter<I> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len, Some(self.len))
+    }
+}
+
 /// `take` implementation for string arrays
 fn take_string<OffsetSize, IndexType>(
     array: &GenericStringArray<OffsetSize>,
@@ -417,53 +443,94 @@ where
     IndexType: ArrowNumericType,
     IndexType::Native: ToPrimitive,
 {
+    if array.is_empty() {
+        return Ok(Default::default());
+    }
+    // Only one branch to check if we can cast to usize up front.
+    ToPrimitive::to_usize(&indices.value(0))
+        .ok_or_else(|| ArrowError::ComputeError("Cast to usize failed".to_string()))?;
+
+    let iter_index = indices
+        .values()
+        .iter()
+        .map(|idx| ToPrimitive::to_usize(idx).unwrap());
+
     let data_len = indices.len();
-
-    let bytes_offset = (data_len + 1) * std::mem::size_of::<OffsetSize>();
-    let mut offsets_buffer = MutableBuffer::from_len_zeroed(bytes_offset);
-
-    let offsets = offsets_buffer.typed_data_mut();
-    let mut values = MutableBuffer::new(0);
     let mut length_so_far = OffsetSize::zero();
-    offsets[0] = length_so_far;
+    let offset_buffer;
+    let values_buffer;
 
     let nulls;
     if array.null_count() == 0 && indices.null_count() == 0 {
-        for (i, offset) in offsets.iter_mut().skip(1).enumerate() {
-            let index = ToPrimitive::to_usize(&indices.value(i)).ok_or_else(|| {
-                ArrowError::ComputeError("Cast to usize failed".to_string())
-            })?;
-
-            let s = array.value(index);
-
+        let offset_iter = iter_index.clone().map(|idx| {
+            let s = array.value(idx);
             length_so_far += OffsetSize::from_usize(s.len()).unwrap();
-            values.extend_from_slice(s.as_bytes());
-            *offset = length_so_far;
-        }
+            length_so_far
+        });
+        let start = &[OffsetSize::zero()];
+        let offset_iter = start.into_iter().copied().chain(offset_iter);
+        // SAFETY
+        //      Chain is a trusted len iter
+        offset_buffer = unsafe { Buffer::from_trusted_len_iter(offset_iter) };
+
+        let values_iter = iter_index
+            .flat_map(|idx| {
+                let s = array.value(idx);
+                s.as_bytes()
+            })
+            .copied();
+        let values_iter =
+            ManualTrustedLengthIter::new(values_iter, length_so_far.to_usize().unwrap());
+
+        // SAFETY
+        //      We determined the total string size in the loop above and manually set that as the trusted length;
+        values_buffer = unsafe { Buffer::from_trusted_len_iter(values_iter) };
         nulls = None
     } else if indices.null_count() == 0 {
+        let offset_iter = iter_index.clone().map(|idx| {
+            let s = array.value(idx);
+            length_so_far += OffsetSize::from_usize(s.len()).unwrap();
+            length_so_far
+        });
+        let start = &[OffsetSize::zero()];
+        let offset_iter = start.into_iter().copied().chain(offset_iter);
+        // SAFETY
+        //      Chain is a trusted len iter
+        offset_buffer = unsafe { Buffer::from_trusted_len_iter(offset_iter) };
+
+        let values_iter = iter_index
+            .clone()
+            .flat_map(|idx| {
+                let s = array.value(idx);
+                s.as_bytes()
+            })
+            .copied();
+
+        // SAFETY
+        //      We determined the total string size in the loop above and manually set that as the trusted length;
+        let values_iter =
+            ManualTrustedLengthIter::new(values_iter, length_so_far.to_usize().unwrap());
+
+        values_buffer = unsafe { Buffer::from_trusted_len_iter(values_iter) };
+
         let num_bytes = bit_util::ceil(data_len, 8);
 
         let mut null_buf = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
         let null_slice = null_buf.as_slice_mut();
 
-        for (i, offset) in offsets.iter_mut().skip(1).enumerate() {
-            let index = ToPrimitive::to_usize(&indices.value(i)).ok_or_else(|| {
-                ArrowError::ComputeError("Cast to usize failed".to_string())
-            })?;
-
-            if array.is_valid(index) {
-                let s = array.value(index);
-
-                length_so_far += OffsetSize::from_usize(s.len()).unwrap();
-                values.extend_from_slice(s.as_bytes());
-            } else {
+        for (i, index) in iter_index.enumerate() {
+            if array.is_null(index) {
                 bit_util::unset_bit(null_slice, i);
             }
-            *offset = length_so_far;
         }
         nulls = Some(null_buf.into());
     } else if array.null_count() == 0 {
+        let bytes_offset = (data_len + 1) * std::mem::size_of::<OffsetSize>();
+        let mut offsets_buffer = MutableBuffer::from_len_zeroed(bytes_offset);
+        let offsets = offsets_buffer.typed_data_mut();
+        offsets[0] = length_so_far;
+        let mut values = MutableBuffer::new(0);
+
         for (i, offset) in offsets.iter_mut().skip(1).enumerate() {
             if indices.is_valid(i) {
                 let index =
@@ -479,7 +546,15 @@ where
             *offset = length_so_far;
         }
         nulls = indices.data_ref().null_buffer().cloned();
+        offset_buffer = offsets_buffer.into();
+        values_buffer = values.into();
     } else {
+        let bytes_offset = (data_len + 1) * std::mem::size_of::<OffsetSize>();
+        let mut offsets_buffer = MutableBuffer::from_len_zeroed(bytes_offset);
+        let offsets = offsets_buffer.typed_data_mut();
+        offsets[0] = length_so_far;
+        let mut values = MutableBuffer::new(0);
+
         let num_bytes = bit_util::ceil(data_len, 8);
 
         let mut null_buf = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
@@ -508,12 +583,14 @@ where
             }
             None => Some(null_buf.into()),
         };
+        offset_buffer = offsets_buffer.into();
+        values_buffer = values.into();
     }
 
     let mut data = ArrayData::builder(<OffsetSize as StringOffsetSizeTrait>::DATA_TYPE)
         .len(data_len)
-        .add_buffer(offsets_buffer.into())
-        .add_buffer(values.into());
+        .add_buffer(offset_buffer)
+        .add_buffer(values_buffer);
     if let Some(null_buffer) = nulls {
         data = data.null_bit_buffer(null_buffer);
     }

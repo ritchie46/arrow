@@ -42,6 +42,12 @@ impl StringOffsetSizeTrait for i64 {
     const DATA_TYPE: DataType = DataType::LargeUtf8;
 }
 
+impl<OffsetSize: StringOffsetSizeTrait> Default for GenericStringArray<OffsetSize> {
+    fn default() -> Self {
+        GenericStringArray::from_vec(vec![])
+    }
+}
+
 /// Generic struct for \[Large\]StringArray
 pub struct GenericStringArray<OffsetSize: StringOffsetSizeTrait> {
     data: ArrayDataRef,
